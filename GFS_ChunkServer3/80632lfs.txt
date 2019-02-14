@@ -1,0 +1,193 @@
+LFS
+Abstract
+This paper presents a new technique for disk storage
+management called a log-structured file system. A logstructured
+file system writes all modifications to disk
+sequentially in a log-like structure, thereby speeding up
+both file writing and crash recovery. The log is the only
+structure on disk; it contains indexing information so that
+files can be read back from the log efficiently. In order to
+maintain large free areas on disk for fast writing, we divide
+the log into segments and use a segment cleaner to
+compress the live information from heavily fragmented
+segments. We present a series of simulations that demonstrate
+the efficiency of a simple cleaning policy based on
+cost and benefit. We have implemented a prototype logstructured
+file system called Sprite LFS; it outperforms
+current Unix file systems by an order of magnitude for
+small-file writes while matching or exceeding Unix performance
+for reads and large writes. Even when the overhead
+for cleaning is included, Sprite LFS can use 70% of the
+disk bandwidth for writing, whereas Unix file systems typically
+can use only 5-10%.
+1. Introduction
+Over the last decade CPU speeds have increased
+dramatically while disk access times have only improved
+slowly. This trend is likely to continue in the future and it
+will cause more and more applications to become diskbound.
+To lessen the impact of this problem, we have devised
+a new disk storage management technique called a
+log-structured file system, which uses disks an order of
+hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh
+The work described here was supported in part by the National
+Science Foundation under grant CCR-8900029, and in part
+by the National Aeronautics and Space Administration and the
+Defense Advanced Research Projects Agency under contract
+NAG2-591.
+This paper will appear in the Proceedings of the 13th ACM Symposium
+on Operating Systems Principles and the February 1992
+ACM Transactions on Computer Systems.
+magnitude more efficiently than current file systems.
+Log-structured file systems are based on the assumption
+that files are cached in main memory and that increasing
+memory sizes will make the caches more and more
+effective at satisfying read requests[1]. As a result, disk
+traffic will become dominated by writes. A log-structured
+file system writes all new information to disk in a sequential
+structure called the log. This approach increases write
+performance dramatically by eliminating almost all seeks.
+The sequential nature of the log also permits much faster
+crash recovery: current Unix file systems typically must
+scan the entire disk to restore consistency after a crash, but
+a log-structured file system need only examine the most
+recent portion of the log.
+The notion of logging is not new, and a number of
+recent file systems have incorporated a log as an auxiliary
+structure to speed up writes and crash recovery[2, 3]. However,
+these other systems use the log only for temporary
+storage; the permanent home for information is in a traditional
+random-access storage structure on disk. In contrast,
+a log-structured file system stores data permanently in the
+log: there is no other structure on disk. The log contains
+indexing information so that files can be read back with
+efficiency comparable to current file systems.
+For a log-structured file system to operate efficiently,
+it must ensure that there are always large extents of free
+space available for writing new data. This is the most
+difficult challenge in the design of a log-structured file system.
+In this paper we present a solution based on large
+extents called segments, where a segment cleaner process
+continually regenerates empty segments by compressing
+the live data from heavily fragmented segments. We used
+a simulator to explore different cleaning policies and
+discovered a simple but effective algorithm based on cost
+and benefit: it segregates older, more slowly changing data
+from young rapidly-changing data and treats them differently
+during cleaning.
+We have constructed a prototype log-structured file
+system called Sprite LFS, which is now in production use
+as part of the Sprite network operating system[4]. Benchmark
+programs demonstrate that the raw writing speed of
+Sprite LFS is more than an order of magnitude greater than
+that of Unix for small files. Even for other workloads, such
+July 24, 1991 - 1 -
+as those including reads and large-file accesses, Sprite LFS
+is at least as fast as Unix in all cases but one (files read
+sequentially after being written randomly). We also measured
+the long-term overhead for cleaning in the production
+system. Overall, Sprite LFS permits about 65-75% of a
+disk’s raw bandwidth to be used for writing new data (the
+rest is used for cleaning). For comparison, Unix systems
+can only utilize 5-10% of a disk’s raw bandwidth for writing
+new data; the rest of the time is spent seeking.
+The remainder of this paper is organized into six sections.
+Section 2 reviews the issues in designing file systems
+for computers of the 1990’s. Section 3 discusses the
+design alternatives for a log-structured file system and
+derives the structure of Sprite LFS, with particular focus on
+the cleaning mechanism. Section 4 describes the crash
+recovery system for Sprite LFS. Section 5 evaluates Sprite
+LFS using benchmark programs and long-term measurements
+of cleaning overhead. Section 6 compares Sprite
+LFS to other file systems, and Section 7 concludes.
+2. Design for file systems of the 1990’s
+File system design is governed by two general
+forces: technology, which provides a set of basic building
+blocks, and workload, which determines a set of operations
+that must be carried out efficiently. This section summarizes
+technology changes that are underway and describes
+their impact on file system design. It also describes the
+workloads that influenced the design of Sprite LFS and
+shows how current file systems are ill-equipped to deal
+with the workloads and technology changes.
+2.1. Technology
+Three components of technology are particularly
+significant for file system design: processors, disks, and
+main memory. Processors are significant because their
+speed is increasing at a nearly exponential rate, and the
+improvements seem likely to continue through much of the
+1990’s. This puts pressure on all the other elements of the
+computer system to speed up as well, so that the system
+doesn’t become unbalanced.
+Disk technology is also improving rapidly, but the
+improvements have been primarily in the areas of cost and
+capacity rather than performance. There are two components
+of disk performance: transfer bandwidth and
+access time. Although both of these factors are improving,
+the rate of improvement is much slower than for CPU
+speed. Disk transfer bandwidth can be improved substantially
+with the use of disk arrays and parallel-head disks[5]
+but no major improvements seem likely for access time (it
+is determined by mechanical motions that are hard to
+improve). If an application causes a sequence of small disk
+transfers separated by seeks, then the application is not
+likely to experience much speedup over the next ten years,
+even with faster processors.
+The third component of technology is main memory,
+which is increasing in size at an exponential rate. Modern
+file systems cache recently-used file data in main memory,
+and larger main memories make larger file caches possible.
+This has two effects on file system behavior. First, larger
+file caches alter the workload presented to the disk by
+absorbing a greater fraction of the read requests[1, 6].
+Most write requests must eventually be reflected on disk for
+safety, so disk traffic (and disk performance) will become
+more and more dominated by writes.
+The second impact of large file caches is that they
+can serve as write buffers where large numbers of modified
+blocks can be collected before writing any of them to disk.
+Buffering may make it possible to write the blocks more
+efficiently, for example by writing them all in a single
+sequential transfer with only one seek. Of course, writebuffering
+has the disadvantage of increasing the amount of
+data lost during a crash. For this paper we will assume that
+crashes are infrequent and that it is acceptable to lose a few
+seconds or minutes of work in each crash; for applications
+that require better crash recovery, non-volatile RAM may
+be used for the write buffer.
+2.2. Workloads
+Several different file system workloads are common
+in computer applications. One of the most difficult workloads
+for file system designs to handle efficiently is found
+in office and engineering environments. Office and
+engineering applications tend to be dominated by accesses
+to small files; several studies have measured mean file
+sizes of only a few kilobytes[1, 6-8]. Small files usually
+result in small random disk I/Os, and the creation and deletion
+times for such files are often dominated by updates to
+file system ‘‘metadata’’ (the data structures used to locate
+the attributes and blocks of the file).
+Workloads dominated by sequential accesses to large
+files, such as those found in supercomputing environments,
+also pose interesting problems, but not for file system
+software. A number of techniques exist for ensuring that
+such files are laid out sequentially on disk, so I/O performance
+tends to be limited by the bandwidth of the I/O and
+memory subsystems rather than the file allocation policies.
+In designing a log-structured file system we decided to
+focus on the efficiency of small-file accesses, and leave it
+to hardware designers to improve bandwidth for large-file
+accesses. Fortunately, the techniques used in Sprite LFS
+work well for large files as well as small ones.
+2.3. Problems with existing file systems
+Current file systems suffer from two general problems
+that make it hard for them to cope with the technologies
+and workloads of the 1990’s. First, they spread information
+around the disk in a way that causes too many small
+accesses. For example, the Berkeley Unix fast file system
+(Unix FFS)[9] is quite effective at laying out each file
+sequentially on disk, but it physically separates different
+files. Furthermore, the attributes (‘‘inode’’) for a file are
+separate from the file’s contents, as is the directory entry
+containing the file’s name. It takes at least five separate
+disk I/Os, each preceded by a seek, to create a new file in

@@ -1,0 +1,223 @@
+LFS
+Unix FFS: two different accesses to the file’s attributes
+plus one access each for the file’s data, the directory’s data,
+and the directory’s attributes. When writing small files in
+such a system, less than 5% of the disk’s potential
+bandwidth is used for new data; the rest of the time is
+spent seeking.
+The second problem with current file systems is that
+they tend to write synchronously: the application must wait
+for the write to complete, rather than continuing while the
+write is handled in the background. For example even
+though Unix FFS writes file data blocks asynchronously,
+file system metadata structures such as directories and
+inodes are written synchronously. For workloads with
+many small files, the disk traffic is dominated by the synchronous
+metadata writes. Synchronous writes couple the
+application’s performance to that of the disk and make it
+hard for the application to benefit from faster CPUs. They
+also defeat the potential use of the file cache as a write
+buffer. Unfortunately, network file systems like NFS[10]
+have introduced additional synchronous behavior where it
+didn’t used to exist. This has simplified crash recovery, but
+it has reduced write performance.
+Throughout this paper we use the Berkeley Unix fast
+file system (Unix FFS) as an example of current file system
+design and compare it to log-structured file systems. The
+Unix FFS design is used because it is well documented in
+the literature and used in several popular Unix operating
+systems. The problems presented in this section are not
+unique to Unix FFS and can be found in most other file systems.
+3. Log-structured file systems
+The fundamental idea of a log-structured file system
+is to improve write performance by buffering a sequence of
+file system changes in the file cache and then writing all the
+changes to disk sequentially in a single disk write operation.
+The information written to disk in the write operation
+includes file data blocks, attributes, index blocks,
+hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh
+iiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiii
+iiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiData structure Purpose Location Section
+iiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiInode Locates blocks of file, holds protection bits, modify time, etc. Log 3.1
+iiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiInode map Locates position of inode in log, holds time of last access plus version number. Log 3.1
+iiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiIndirect block Locates blocks of large files. Log 3.1
+iiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiSegment summary Identifies contents of segment (file number and offset for each block). Log 3.2
+iiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiSegment usage table Counts live bytes still left in segments, stores last write time for data in segments. Log 3.6
+iiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiSuperblock Holds static configuration information such as number of segments and segment size. Fixed None
+iiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiCheckpoint region Locates blocks of inode map and segment usage table, identifies last checkpoint in log. Fixed 4.1
+ciiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiicDirectory change log Records directory operations to maintain consistency of reference counts in inodes. Log 4.2
+c
+c
+c
+c
+c
+c
+c
+c
+c
+c
+cc
+c
+c
+c
+c
+c
+c
+c
+c
+c
+c
+cc
+c
+c
+c
+c
+c
+c
+c
+c
+c
+c
+cc
+c
+c
+c
+c
+c
+c
+c
+c
+c
+c
+cc
+c
+c
+c
+c
+c
+c
+c
+c
+c
+c
+Table 1 — Summary of the major data structures stored on disk by Sprite LFS.
+For each data structure the table indicates the purpose served by the data structure in Sprite LFS. The table also indicates whether the data
+structure is stored in the log or at a fixed position on disk and where in the paper the data structure is discussed in detail. Inodes, indirect
+blocks, and superblocks are similar to the Unix FFS data structures with the same names. Note that Sprite LFS contains neither a bitmap
+nor a free list.
+hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh
+directories, and almost all the other information used to
+manage the file system. For workloads that contain many
+small files, a log-structured file system converts the many
+small synchronous random writes of traditional file systems
+into large asynchronous sequential transfers that can utilize
+nearly 100% of the raw disk bandwidth.
+Although the basic idea of a log-structured file system
+is simple, there are two key issues that must be
+resolved to achieve the potential benefits of the logging
+approach. The first issue is how to retrieve information
+from the log; this is the subject of Section 3.1 below. The
+second issue is how to manage the free space on disk so
+that large extents of free space are always available for
+writing new data. This is a much more difficult issue; it is
+the topic of Sections 3.2-3.6. Table 1 contains a summary
+of the on-disk data structures used by Sprite LFS to solve
+the above problems; the data structures are discussed in
+detail in later sections of the paper.
+3.1. File location and reading
+Although the term ‘‘log-structured’’ might suggest
+that sequential scans are required to retrieve information
+from the log, this is not the case in Sprite LFS. Our goal
+was to match or exceed the read performance of Unix FFS.
+To accomplish this goal, Sprite LFS outputs index structures
+in the log to permit random-access retrievals. The
+basic structures used by Sprite LFS are identical to those
+used in Unix FFS: for each file there exists a data structure
+called an inode, which contains the file’s attributes (type,
+owner, permissions, etc.) plus the disk addresses of the
+first ten blocks of the file; for files larger than ten blocks,
+the inode also contains the disk addresses of one or more
+indirect blocks, each of which contains the addresses of
+more data or indirect blocks. Once a file’s inode has been
+found, the number of disk I/Os required to read the file is
+identical in Sprite LFS and Unix FFS.
+In Unix FFS each inode is at a fixed location on disk;
+given the identifying number for a file, a simple calculation
+July 24, 1991 - 3 -
+yields the disk address of the file’s inode. In contrast,
+Sprite LFS doesn’t place inodes at fixed positions; they are
+written to the log. Sprite LFS uses a data structure called
+an inode map to maintain the current location of each
+inode. Given the identifying number for a file, the inode
+map must be indexed to determine the disk address of the
+inode. The inode map is divided into blocks that are written
+to the log; a fixed checkpoint region on each disk
+identifies the locations of all the inode map blocks. Fortunately,
+inode maps are compact enough to keep the active
+portions cached in main memory: inode map lookups
+rarely require disk accesses.
+Figure 1 shows the disk layouts that would occur in
+Sprite LFS and Unix FFS after creating two new files in
+different directories. Although the two layouts have the
+same logical structure, the log-structured file system produces
+a much more compact arrangement. As a result, the
+write performance of Sprite LFS is much better than Unix
+FFS, while its read performance is just as good.
+3.2. Free space management: segments
+The most difficult design issue for log-structured file
+systems is the management of free space. The goal is to
+maintain large free extents for writing new data. Initially
+all the free space is in a single extent on disk, but by the
+time the log reaches the end of the disk the free space will
+have been fragmented into many small extents corresponding
+to the files that were deleted or overwritten.
+From this point on, the file system has two choices:
+threading and copying. These are illustrated in Figure 2.
+The first alternative is to leave the live data in place and
+thread the log through the free extents. Unfortunately,
+threading will cause the free space to become severely
+fragmented, so that large contiguous writes won’t be possible
+and a log-structured file system will be no faster than
+hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh
+file1 file2
+dir1 dir2
+Block key: Inode Directory Data
+Disk
+file2
+dir2
+file1
+dir1
+Disk
+Sprite LFS Unix FFS
+Inode map
+Log
+Figure 1 — A comparison between Sprite LFS and Unix FFS.
+This example shows the modified disk blocks written by Sprite LFS and Unix FFS when creating two single-block files named
+dir1/file1 and dir2/file2. Each system must write new data blocks and inodes for file1 and file2, plus new data blocks
+and inodes for the containing directories. Unix FFS requires ten non-sequential writes for the new information (the inodes for the new files
+are each written twice to ease recovery from crashes), while Sprite LFS performs the operations in a single large write. The same number
+of disk accesses will be required to read the files in the two systems. Sprite LFS also writes out new inode map blocks to record the new
+inode locations.
+hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh
+operation is complete, the segments that were read are
+marked as clean, and they can be used for new data or for
+additional cleaning.
+As part of segment cleaning it must be possible to
+identify which blocks of each segment are live, so that they
+can be written out again. It must also be possible to identify
+the file to which each block belongs and the position of
+the block within the file; this information is needed in order
+to update the file’s inode to point to the new location of the
+block. Sprite LFS solves both of these problems by writing
+a segment summary block as part of each segment. The
+summary block identifies each piece of information that is
+written in the segment; for example, for each file data block
+the summary block contains the file number and block
+number for the block. Segments can contain multiple segment
+summary blocks when more than one log write is
+needed to fill the segment. (Partial-segment writes occur
+when the number of dirty blocks buffered in the file cache
+is insufficient to fill a segment.) Segment summary blocks
+impose little overhead during writing, and they are useful
+during crash recovery (see Section 4) as well as during
+cleaning.

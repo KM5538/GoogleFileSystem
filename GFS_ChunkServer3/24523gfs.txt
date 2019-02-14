@@ -1,0 +1,204 @@
+GFS
+The state of a file region after a data mutation depends
+on the type of mutation, whether it succeeds or fails, and
+whether there are concurrent mutations. Table 1 summarizes
+the result. A file region is consistent if all clients will
+always see the same data, regardless of which replicas they
+read from. A region is defined after a file data mutation if it
+is consistent and clients will see what the mutation writes in
+its entirety. When a mutation succeeds without interference
+from concurrent writers, the affected region is defined (and
+by implication consistent): all clients will always see what
+the mutation has written. Concurrent successful mutations
+leave the region undefined but consistent: all clients see the
+same data, but it may not reflect what any one mutation
+has written. Typically, it consists of mingled fragments from
+multiple mutations. A failed mutation makes the region inconsistent
+(hence also undefined): different clients may see
+different data at different times. We describe below how our
+applications can distinguish defined regions from undefined
+regions. The applications do not need to further distinguish
+between different kinds of undefined regions.
+Data mutations may be writes or record appends. A write
+causes data to be written at an application-specified file
+offset. A record append causes data (the “record”) to be
+appended atomically at least once even in the presence of
+concurrent mutations, but at an offset of GFS’s choosing
+(Section 3.3). (In contrast, a “regular” append is merely a
+write at an offset that the client believes to be the current
+end of file.) The offset is returned to the client and marks
+the beginning of a defined region that contains the record.
+In addition, GFS may insert padding or record duplicates in
+between. They occupy regions considered to be inconsistent
+and are typically dwarfed by the amount of user data.
+After a sequence of successful mutations, the mutated file
+region is guaranteed to be defined and contain the data written
+by the last mutation. GFS achieves this by (a) applying
+mutations to a chunkin the same order on all its replicas
+(Section 3.1), and (b) using chunkversion numbers to detect
+any replica that has become stale because it has missed mutations
+while its chunkserver was down (Section 4.5). Stale
+replicas will never be involved in a mutation or given to
+clients asking the master for chunk locations. They are
+garbage collected at the earliest opportunity.
+Since clients cache chunklocations, they may read from a
+stale replica before that information is refreshed. This window
+is limited by the cache entry’s timeout and the next
+open of the file, which purges from the cache all chunkinformation
+for that file. Moreover, as most of our files are
+append-only, a stale replica usually returns a premature
+end of chunkrather than outdated data. When a reader
+retries and contacts the master, it will immediately get current
+chunklocations.
+Long after a successful mutation, component failures can
+of course still corrupt or destroy data. GFS identifies failed
+chunkservers by regular handshakes between master and all
+chunkservers and detects data corruption by checksumming
+(Section 5.2). Once a problem surfaces, the data is restored
+from valid replicas as soon as possible (Section 4.3). A chunk
+is lost irreversibly only if all its replicas are lost before GFS
+can react, typically within minutes. Even in this case, it becomes
+unavailable, not corrupted: applications receive clear
+errors rather than corrupt data.
+2.7.2 Implications for Applications
+GFS applications can accommodate the relaxed consistency
+model with a few simple techniques already needed for
+other purposes: relying on appends rather than overwrites,
+checkpointing, and writing self-validating, self-identifying
+records.
+Practically all our applications mutate files by appending
+rather than overwriting. In one typical use, a writer generates
+a file from beginning to end. It atomically renames the
+file to a permanent name after writing all the data, or periodically
+checkpoints how much has been successfully written.
+Checkpoints may also include application-level checksums.
+Readers verify and process only the file region up
+to the last checkpoint, which is known to be in the defined
+state. Regardless of consistency and concurrency issues, this
+approach has served us well. Appending is far more effi-
+cient and more resilient to application failures than random
+writes. Checkpointing allows writers to restart incrementally
+and keeps readers from processing successfully written
+file data that is still incomplete from the application’s perspective.
+In the other typical use, many writers concurrently append
+to a file for merged results or as a producer-consumer
+queue. Record append’s append-at-least-once semantics preserves
+each writer’s output. Readers deal with the occasional
+padding and duplicates as follows. Each record prepared
+by the writer contains extra information like checksums
+so that its validity can be verified. A reader can
+identify and discard extra padding and record fragments
+using the checksums. If it cannot tolerate the occasional
+duplicates (e.g., if they would trigger non-idempotent operations),
+it can filter them out using unique identifiers in
+the records, which are often needed anyway to name corresponding
+application entities such as web documents. These
+functionalities for record I/O (except duplicate removal) are
+in library code shared by our applications and applicable to
+other file interface implementations at Google. With that,
+the same sequence of records, plus rare duplicates, is always
+delivered to the record reader.
+3. SYSTEM INTERACTIONS
+We designed the system to minimize the master’s involvement
+in all operations. With that background, we now describe
+how the client, master, and chunkservers interact to
+implement data mutations, atomic record append, and snapshot.
+3.1 Leases and Mutation Order
+A mutation is an operation that changes the contents or
+metadata of a chunksuch as a write or an append operation.
+Each mutation is performed at all the chunk’s replicas.
+We use leases to maintain a consistent mutation order across
+replicas. The master grants a chunklease to one of the replicas,
+which we call the primary. The primary picks a serial
+order for all mutations to the chunk. All replicas follow this
+order when applying mutations. Thus, the global mutation
+order is defined first by the lease grant order chosen by the
+master, and within a lease by the serial numbers assigned
+by the primary.
+The lease mechanism is designed to minimize management
+overhead at the master. A lease has an initial timeout
+of 60 seconds. However, as long as the chunkis being mutated,
+the primary can request and typically receive extensions
+from the master indefinitely. These extension requests
+and grants are piggybacked on the HeartBeat messages regularly
+exchanged between the master and all chunkservers.
+The master may sometimes try to revoke a lease before it
+expires (e.g., when the master wants to disable mutations
+on a file that is being renamed). Even if the master loses
+communication with a primary, it can safely grant a new
+lease to another replica after the old lease expires.
+In Figure 2, we illustrate this process by following the
+control flow of a write through these numbered steps.
+1. The client asks the master which chunkserver holds
+the current lease for the chunkand the locations of
+the other replicas. If no one has a lease, the master
+grants one to a replica it chooses (not shown).
+2. The master replies with the identity of the primary and
+the locations of the other (secondary) replicas. The
+client caches this data for future mutations. It needs
+to contact the master again only when the primary
+Primary
+Replica
+Secondary
+Replica B
+Secondary
+Replica A
+Master
+Legend:
+Control
+Data
+3
+Client
+2
+4 step 1
+5
+6
+6
+7
+Figure 2: Write Control and Data Flow
+becomes unreachable or replies that it no longer holds
+a lease.
+3. The client pushes the data to all the replicas. A client
+can do so in any order. Each chunkserver will store
+the data in an internal LRU buffer cache until the
+data is used or aged out. By decoupling the data flow
+from the control flow, we can improve performance by
+scheduling the expensive data flow based on the networktopology
+regardless of which chunkserver is the
+primary. Section 3.2 discusses this further.
+4. Once all the replicas have acknowledged receiving the
+data, the client sends a write request to the primary.
+The request identifies the data pushed earlier to all of
+the replicas. The primary assigns consecutive serial
+numbers to all the mutations it receives, possibly from
+multiple clients, which provides the necessary serialization.
+It applies the mutation to its own local state
+in serial number order.
+5. The primary forwards the write request to all secondary
+replicas. Each secondary replica applies mutations
+in the same serial number order assigned by
+the primary.
+6. The secondaries all reply to the primary indicating
+that they have completed the operation.
+7. The primary replies to the client. Any errors encountered
+at any of the replicas are reported to the client.
+In case of errors, the write may have succeeded at the
+primary and an arbitrary subset of the secondary replicas.
+(If it had failed at the primary, it would not
+have been assigned a serial number and forwarded.)
+The client request is considered to have failed, and the
+modified region is left in an inconsistent state. Our
+client code handles such errors by retrying the failed
+mutation. It will make a few attempts at steps (3)
+through (7) before falling backto a retry from the beginning
+of the write.
+If a write by the application is large or straddles a chunk
+boundary, GFS client code breaks it down into multiple
+write operations. They all follow the control flow described
+above but may be interleaved with and overwritten by concurrent
+operations from other clients. Therefore, the shared
+file region may end up containing fragments from different
+clients, although the replicas will be identical because the individual
+operations are completed successfully in the same
+order on all replicas. This leaves the file region in consistent
+but undefined state as noted in Section 2.7.

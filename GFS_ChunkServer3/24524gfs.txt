@@ -1,0 +1,194 @@
+GFS
+3.2 Data Flow
+We decouple the flow of data from the flow of control to
+use the networkefficiently. While control flows from the
+client to the primary and then to all secondaries, data is
+pushed linearly along a carefully picked chain of chunkservers
+in a pipelined fashion. Our goals are to fully utilize each
+machine’s networkbandwidth, avoid networkbottlenecks
+and high-latency links, and minimize the latency to push
+through all the data.
+To fully utilize each machine’s networkbandwidth, the
+data is pushed linearly along a chain of chunkservers rather
+than distributed in some other topology (e.g., tree). Thus,
+each machine’s full outbound bandwidth is used to transfer
+the data as fast as possible rather than divided among
+multiple recipients.
+To avoid network bottlenecks and high-latency links (e.g.,
+inter-switch links are often both) as much as possible, each
+machine forwards the data to the “closest” machine in the
+networktopology that has not received it. Suppose the
+client is pushing data to chunkservers S1 through S4. It
+sends the data to the closest chunkserver, say S1. S1 forwards
+it to the closest chunkserver S2 through S4 closest to
+S1, say S2. Similarly, S2 forwards it to S3 or S4, whichever
+is closer to S2, and so on. Our networktopology is simple
+enough that “distances” can be accurately estimated from
+IP addresses.
+Finally, we minimize latency by pipelining the data transfer
+over TCP connections. Once a chunkserver receives some
+data, it starts forwarding immediately. Pipelining is especially
+helpful to us because we use a switched networkwith
+full-duplex links. Sending the data immediately does not
+reduce the receive rate. Without networkcongestion, the
+ideal elapsed time for transferring B bytes to R replicas is
+B/T + RL where T is the networkthroughput and L is latency
+to transfer bytes between two machines. Our network
+links are typically 100 Mbps (T), and L is far below 1 ms.
+Therefore, 1 MB can ideally be distributed in about 80 ms.
+3.3 Atomic Record Appends
+GFS provides an atomic append operation called record
+append. In a traditional write, the client specifies the off-
+set at which data is to be written. Concurrent writes to
+the same region are not serializable: the region may end up
+containing data fragments from multiple clients. In a record
+append, however, the client specifies only the data. GFS
+appends it to the file at least once atomically (i.e., as one
+continuous sequence of bytes) at an offset of GFS’s choosing
+and returns that offset to the client. This is similar to writing
+to a file opened in O APPEND mode in Unix without the
+race conditions when multiple writers do so concurrently.
+Record append is heavily used by our distributed applications
+in which many clients on different machines append
+to the same file concurrently. Clients would need additional
+complicated and expensive synchronization, for example
+through a distributed lockmanager, if they do so
+with traditional writes. In our workloads, such files often
+serve as multiple-producer/single-consumer queues or contain
+merged results from many different clients.
+Record append is a kind of mutation and follows the control
+flow in Section 3.1 with only a little extra logic at the
+primary. The client pushes the data to all replicas of the
+last chunkof the file Then, it sends its request to the primary.
+The primary checks to see if appending the record
+to the current chunkwould cause the chunkto exceed the
+maximum size (64 MB). If so, it pads the chunkto the maximum
+size, tells secondaries to do the same, and replies to
+the client indicating that the operation should be retried
+on the next chunk. (Record append is restricted to be at
+most one-fourth of the maximum chunksize to keep worstcase
+fragmentation at an acceptable level.) If the record
+fits within the maximum size, which is the common case,
+the primary appends the data to its replica, tells the secondaries
+to write the data at the exact offset where it has, and
+finally replies success to the client.
+If a record append fails at any replica, the client retries the
+operation. As a result, replicas of the same chunkmay contain
+different data possibly including duplicates of the same
+record in whole or in part. GFS does not guarantee that all
+replicas are bytewise identical. It only guarantees that the
+data is written at least once as an atomic unit. This property
+follows readily from the simple observation that for the
+operation to report success, the data must have been written
+at the same offset on all replicas of some chunk. Furthermore,
+after this, all replicas are at least as long as the end
+of record and therefore any future record will be assigned a
+higher offset or a different chunkeven if a different replica
+later becomes the primary. In terms of our consistency guarantees,
+the regions in which successful record append operations
+have written their data are defined (hence consistent),
+whereas intervening regions are inconsistent (hence unde-
+fined). Our applications can deal with inconsistent regions
+as we discussed in Section 2.7.2.
+3.4 Snapshot
+The snapshot operation makes a copy of a file or a directory
+tree (the “source”) almost instantaneously, while minimizing
+any interruptions of ongoing mutations. Our users
+use it to quickly create branch copies of huge data sets (and
+often copies of those copies, recursively), or to checkpoint
+the current state before experimenting with changes that
+can later be committed or rolled backeasily.
+Like AFS [5], we use standard copy-on-write techniques to
+implement snapshots. When the master receives a snapshot
+request, it first revokes any outstanding leases on the chunks
+in the files it is about to snapshot. This ensures that any
+subsequent writes to these chunks will require an interaction
+with the master to find the lease holder. This will give the
+master an opportunity to create a new copy of the chunk
+first.
+After the leases have been revoked or have expired, the
+master logs the operation to disk. It then applies this log
+record to its in-memory state by duplicating the metadata
+for the source file or directory tree. The newly created snapshot
+files point to the same chunks as the source files.
+The first time a client wants to write to a chunkC after
+the snapshot operation, it sends a request to the master to
+find the current lease holder. The master notices that the
+reference count for chunkC is greater than one. It defers
+replying to the client request and instead picks a new chunk
+handle C’. It then asks each chunkserver that has a current
+replica of C to create a new chunkcalled C’. By creating
+the new chunkon the same chunkservers as the original, we
+ensure that the data can be copied locally, not over the network(our
+disks are about three times as fast as our 100 Mb
+Ethernet links). From this point, request handling is no different
+from that for any chunk: the master grants one of the
+replicas a lease on the new chunkC’ and replies to the client,
+which can write the chunknormally, not knowing that it has
+just been created from an existing chunk.
+4. MASTER OPERATION
+The master executes all namespace operations. In addition,
+it manages chunkreplicas throughout the system: it
+makes placement decisions, creates new chunks and hence
+replicas, and coordinates various system-wide activities to
+keep chunks fully replicated, to balance load across all the
+chunkservers, and to reclaim unused storage. We now discuss
+each of these topics.
+4.1 Namespace Management and Locking
+Many master operations can take a long time: for example,
+a snapshot operation has to revoke chunkserver leases on
+all chunks covered by the snapshot. We do not want to delay
+other master operations while they are running. Therefore,
+we allow multiple operations to be active and use locks over
+regions of the namespace to ensure proper serialization.
+Unlike many traditional file systems, GFS does not have
+a per-directory data structure that lists all the files in that
+directory. Nor does it support aliases for the same file or
+directory (i.e, hard or symbolic links in Unix terms). GFS
+logically represents its namespace as a lookup table mapping
+full pathnames to metadata. With prefix compression, this
+table can be efficiently represented in memory. Each node
+in the namespace tree (either an absolute file name or an
+absolute directory name) has an associated read-write lock.
+Each master operation acquires a set of locks before it
+runs. Typically, if it involves /d1/d2/.../dn/leaf, it will
+acquire read-locks on the directory names /d1, /d1/d2, ...,
+/d1/d2/.../dn, and either a read lockor a write lockon the
+full pathname /d1/d2/.../dn/leaf. Note that leaf may be
+a file or directory depending on the operation.
+We now illustrate how this locking mechanism can prevent
+a file /home/user/foo from being created while /home/user
+is being snapshotted to /save/user. The snapshot operation
+acquires read lock s on /home and /save, and write
+locks on /home/user and /save/user. The file creation acquires
+read locks on /home and /home/user, and a write
+lockon /home/user/foo. The two operations will be serialized
+properly because they try to obtain conflicting locks
+on /home/user. File creation does not require a write lock
+on the parent directory because there is no “directory”, or
+inode-like, data structure to be protected from modification.
+The read lockon the name is sufficient to protect the parent
+directory from deletion.
+One nice property of this locking scheme is that it allows
+concurrent mutations in the same directory. For example,
+multiple file creations can be executed concurrently in the
+same directory: each acquires a read lockon the directory
+name and a write lockon the file name. The read lockon
+the directory name suffices to prevent the directory from
+being deleted, renamed, or snapshotted. The write locks on
+file names serialize attempts to create a file with the same
+name twice.
+Since the namespace can have many nodes, read-write lock
+objects are allocated lazily and deleted once they are not in
+use. Also, locks are acquired in a consistent total order
+to prevent deadlock: they are first ordered by level in the
+namespace tree and lexicographically within the same level.
+4.2 Replica Placement
+A GFS cluster is highly distributed at more levels than
+one. It typically has hundreds of chunkservers spread across
+many machine racks. These chunkservers in turn may be
+accessed from hundreds of clients from the same or different
+racks. Communication between two machines on different
+racks may cross one or more network switches. Additionally,
+bandwidth into or out of a rackmay be less than the
+aggregate bandwidth of all the machines within the rack.
